@@ -291,16 +291,22 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
 
         step = "username"
         print("[LOGIN] Inserisco email PosteID...")
-        await page.get_by_role("textbox", name="Indirizzo e-mail").fill(username)
+        # NB: la label del campo e' "Nome utente" (il placeholder e' "inserisci
+        # e-mail"), quindi get_by_role(name=...) sull'accessible name non
+        # combacia. Usiamo l'id, stabile e indipendente dal testo della label.
+        await page.locator("#username").fill(username)
         await logger.log(page, "username")
 
         step = "password"
         print("[LOGIN] Inserisco password PosteID...")
-        await page.get_by_role("textbox", name="Password").fill(password)
+        await page.locator("#password").fill(password)
 
         step = "avanti"
-        print("[LOGIN] Clicco 'Avanti'...")
-        await page.get_by_role("button", name="Avanti").click()
+        # NB: il form PosteID e' a step unico (username+password+submit), il
+        # bottone di submit si chiama "Entra con SPID", non "Avanti".
+        login_form_url = page.url
+        print("[LOGIN] Clicco 'Entra con SPID'...")
+        await page.get_by_role("button", name="Entra con SPID").click()
         await logger.log(page, "avanti")
 
         step = "attesa_app"
@@ -316,10 +322,13 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
             f"se rimane sulla form = credenziali probabilmente errate"
         )
         try:
-            # Attendiamo che l'URL CAMBI dalla pagina di login. wait_for_url
-            # con un pattern wildcard fallisce se restiamo sullo stesso URL.
+            # Attendiamo che l'URL CAMBI rispetto alla form di login (es.
+            # transita a 'login-posteid.jsp', lo step di attesa push, che
+            # contiene comunque la sottostringa 'login' — un controllo su
+            # quella sottostringa darebbe quindi un falso negativo).
             await page.wait_for_function(
-                "url => !window.location.href.includes('login') && !window.location.href.includes('Login')",
+                "prevUrl => window.location.href !== prevUrl",
+                arg=login_form_url,
                 timeout=appear_timeout_s * 1000,
             )
         except PlaywrightTimeoutError as e:
@@ -331,10 +340,40 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
                 f"flusso PosteID modificato. URL corrente: {current_url}"
             ) from e
 
+        step = "richiedi_notifica_push"
+        # Lo step 'login-posteid.jsp' non invia la push automaticamente:
+        # bisogna cliccare esplicitamente "Voglio ricevere una notifica
+        # sull'App PosteID", altrimenti l'app non riceve mai nulla.
+        print("[LOGIN] Clicco 'Voglio ricevere una notifica sull'App PosteID'...")
+        await page.get_by_text("Voglio ricevere una notifica sull'App PosteID").click()
+        await logger.log(page, "richiedi_notifica_push")
+
+        step = "attesa_approvazione_e_consenso"
         print("[LOGIN] Attendo approvazione sull'app PosteID (timeout 120s)...")
-        # PosteID reindirizza automaticamente dopo l'approvazione sull'app:
-        # aspettiamo che il browser torni sul dominio agenziaentrate.
-        await page.wait_for_url("**/agenziaentrate.gov.it/**", timeout=120000)
+        # Dopo l'approvazione sul telefono, prima del redirect finale verso
+        # agenziaentrate PosteID mostra talvolta una schermata di consenso
+        # alla condivisione dei dati ("Acconsento"). Non sappiamo a priori se
+        # comparira' (dipende dal fatto che l'utente l'abbia gia' data in
+        # precedenza), quindi facciamo polling: appena appare la clicchiamo e
+        # continuiamo ad aspettare il redirect, senza consumare il timeout
+        # complessivo di attesa push.
+        # exact=True: senza, il match per sottostringa prende anche "Non acconsento".
+        consent_button = page.get_by_role("button", name="Acconsento", exact=True)
+        deadline = asyncio.get_event_loop().time() + 120
+        while True:
+            if "agenziaentrate.gov.it" in page.url:
+                break
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise PlaywrightTimeoutError(
+                    "Timeout attesa approvazione PosteID / consenso (120s)"
+                )
+            try:
+                await consent_button.click(timeout=min(2000, max(remaining * 1000, 0)))
+                print("[LOGIN] Clicco 'Acconsento'...")
+                await logger.log(page, "acconsento")
+            except PlaywrightTimeoutError:
+                pass
         await logger.log(page, "redirect_post_auth")
     except Exception:
         await logger.log(page, f"ERRORE_poste_{step}")

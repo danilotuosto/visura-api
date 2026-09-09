@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import secrets
+import signal
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -826,9 +827,20 @@ def get_visura_service() -> VisuraService:
 
 
 # Signal handler per shutdown graceful
-# Nota: NON usiamo signal handler custom perché sys.exit() uccide il processo
-# prima che il logout async possa completare. Uvicorn gestisce già SIGINT/SIGTERM
-# e passa per il lifespan shutdown dove il logout viene eseguito correttamente.
+# Nota: NON usiamo signal handler custom per lo shutdown della fase di serving:
+# uvicorn gestisce già SIGINT/SIGTERM e passa per il lifespan shutdown dove il
+# logout viene eseguito correttamente (sys.exit() ucciderebbe il processo
+# prima che il logout async possa completare).
+#
+# La fase di STARTUP è un caso diverso: il login (fino a 120s di attesa
+# dell'approvazione push SPID) è un singolo await bloccante prima dello
+# ``yield``, e uvicorn non lo interrompe — nota su should_exit: il flag viene
+# controllato solo dal loop di serving, che parte dopo lo startup. Senza
+# gestione esplicita, Ctrl+C durante l'attesa push non ha alcun effetto finché
+# il login non completa (o fallisce) da solo. Installiamo quindi un handler
+# temporaneo, attivo solo durante lo startup, che cancella il task di init;
+# l'handler precedente (quello di uvicorn) viene ripristinato subito dopo, cosi'
+# lo shutdown graceful post-yield resta invariato.
 
 
 @asynccontextmanager
@@ -837,7 +849,28 @@ async def lifespan(app: FastAPI):
     global visura_service  # noqa: PLW0603 - FastAPI lifespan singleton pattern
     PageLogger.reset_session()  # Nuova sessione di log per ogni avvio
     visura_service = VisuraService()
-    await visura_service.initialize()
+
+    loop = asyncio.get_running_loop()
+    init_task = loop.create_task(visura_service.initialize())
+
+    def _interrupt_startup(signum, frame):
+        logger.info("Ctrl+C ricevuto durante l'avvio: annullo l'inizializzazione in corso...")
+        loop.call_soon_threadsafe(init_task.cancel)
+
+    previous_handlers = {sig: signal.signal(sig, _interrupt_startup) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        await init_task
+    except asyncio.CancelledError:
+        logger.info("Avvio interrotto dall'utente prima del completamento del login.")
+        try:
+            await visura_service.browser_manager.close()
+        except Exception as e:
+            logger.warning(f"Errore durante la chiusura del browser dopo l'interruzione: {e}")
+        raise
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
     logger.info("Servizio visure avviato")
     yield
     # Shutdown — uvicorn arriva qui dopo SIGINT/SIGTERM
